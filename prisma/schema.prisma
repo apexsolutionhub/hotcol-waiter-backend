@@ -235,6 +235,10 @@ model tenant_account {
   receptionCmPortalEnabled Boolean @default(false)
   /// Apex opt-in: Café and Restaurant properties may use HotCol Waiter ordering.
   waiterOrderingEnabled Boolean @default(false)
+  /// Apex opt-in (café + HR Module): dedicated HR Manager role vs Admin hosting HR.
+  hrSoloManagerEnabled Boolean @default(false)
+  /// Apex opt-in: use biometric clock path when devices are configured.
+  hrBiometricsEnabled Boolean @default(false)
   /// Manager/Admin opt-in: waiters may send payment-approval requests to cashiers.
   waiterPaymentApprovalEnabled Boolean @default(false)
   /// digital | analog — café/restaurant order fulfillment
@@ -976,6 +980,14 @@ model lodging_room {
   floor              String    @default("")
   /// Nightly rate in ETB (Manager-set).
   pricePerNightETB   Float     @default(0)
+  /// King | Queen | Twin | … (display / inventory)
+  bedType            String    @default("")
+  /// Max adult guests the room is sold for.
+  capacity           Int       @default(2)
+  /// Free-text amenities (comma-separated or short list).
+  amenities          String    @default("") @db.VarChar(2048)
+  /// Optional room photo URL.
+  imageUrl           String    @default("") @db.VarChar(2048)
   /// vacant_dirty | occupied | vacant_clean | on_maintenance | reserved | inspected | out_of_order | out_of_service | blocked
   status             String    @default("vacant_clean")
   /// When status is on_maintenance — expected ready datetime (legacy; prefer statusExpectedEndAt).
@@ -1178,7 +1190,7 @@ model lodging_bill {
 model lodging_bill_line {
   id                Int       @id @default(autoincrement())
   billId            Int
-  /// room | food_drink | laundry | other | discount
+  /// room | food_drink | laundry | other | penalty | discount
   kind              String
   description       String
   quantity          Float     @default(1)
@@ -1186,6 +1198,8 @@ model lodging_bill_line {
   amountETB         Float     @default(0)
   taxPercent        Float     @default(0)
   taxETB            Float     @default(0)
+  /// JSON array: [{ name, percent, amountETB }] — named tax split at posting time
+  taxDetailJson     String    @default("") @db.VarChar(4096)
   roomNumber        String    @default("")
   fulfillmentStatus String    @default("pending")
   fulfilledAt       DateTime?
@@ -1271,18 +1285,22 @@ model lodging_action_log {
   @@index([actorName])
 }
 
-/// Tax percent per bill line kind (room | food_drink | laundry | other).
+/// Named tax rows per folio kind (e.g. VAT 15% on room). Multiple names per kind allowed.
 model lodging_tax_config {
   id         Int      @id @default(autoincrement())
   HotelName  String
+  /// Display name e.g. VAT, City tax
+  name       String   @default("Tax")
+  /// room | food_drink | laundry | other | penalty
   kind       String
   taxPercent Float    @default(0)
   updatedBy  String   @default("")
   updatedAt  DateTime @updatedAt
   createdAt  DateTime @default(now())
 
-  @@unique([HotelName, kind])
+  @@unique([HotelName, kind, name])
   @@index([HotelName])
+  @@index([HotelName, kind])
 }
 
 /// Manual business-day / shift close (night audit). Multiple overlapping shifts allowed.
@@ -1299,6 +1317,9 @@ model lodging_business_day {
   status       String    @default("open")
   closedAt     DateTime?
   closedBy     String    @default("")
+  /// Receptionist this close/report is scoped to (optional for legacy rows).
+  receptionistId   Int?
+  receptionistName String @default("")
   summaryJson  String    @db.Text
   createdAt    DateTime  @default(now())
   updatedAt    DateTime  @updatedAt
@@ -1307,6 +1328,42 @@ model lodging_business_day {
   @@index([HotelName, status])
   @@index([HotelName, businessDate])
   @@index([HotelName, fromAt])
+  @@index([HotelName, receptionistId])
+}
+
+/// Named receptionists under the shared Reception desk login (password identifies who).
+model lodging_receptionist {
+  id           Int      @id @default(autoincrement())
+  HotelName    String
+  firstName    String
+  lastName     String
+  passwordHash String
+  isActive     Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+  updatedBy    String   @default("")
+
+  @@index([HotelName])
+  @@index([HotelName, isActive])
+}
+
+/// Cleaners and maintainers roster (Manager-managed; CM assigns by name).
+model lodging_cm_staff {
+  id         Int      @id @default(autoincrement())
+  HotelName  String
+  /// cleaner | maintainer
+  role       String
+  firstName  String
+  lastName   String
+  isActive   Boolean  @default(true)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+  updatedBy  String   @default("")
+
+  @@index([HotelName])
+  @@index([HotelName, role])
+  @@index([HotelName, role, isActive])
+  @@unique([HotelName, role, firstName, lastName])
 }
 
 /// Sellable rate plans (rack, corporate, seasonal, weekend, promo, long-stay…).
@@ -1397,6 +1454,10 @@ model hr_employee {
   email           String    @default("")
   department      String    @default("")
   jobTitle        String    @default("")
+  /// leader | employee — org hierarchy position (not job title text)
+  orgPosition     String    @default("employee")
+  /// Optional team under department
+  teamId          Int?
   /// active | on_leave | terminated
   status          String    @default("active")
   hireDate        String    @default("") // YYYY-MM-DD
@@ -1409,6 +1470,18 @@ model hr_employee {
   credentialUserId Int?
   credentialUserName String @default("")
   notes           String    @db.Text
+  /// bcrypt hash of portal OTP/PIN for hotcol-emp
+  portalOtpHash   String    @default("")
+  /// Current portal code for global login lookup (like lodging guestOtp). Unique among active portal employees at issue time.
+  portalOtpLookup String    @default("")
+  /// Plaintext preview only while portalOtpViewer allows (cleared after first login)
+  portalOtpPreview String   @default("")
+  /// HR | Manager | none — who may read portalOtpPreview
+  portalOtpViewer String    @default("none")
+  mustChangeOtp   Boolean   @default(false)
+  portalOtpIssuedAt DateTime?
+  portalFirstLoginAt DateTime?
+  profileImageUrl String    @default("")
   createdAt       DateTime  @default(now())
   updatedAt       DateTime  @updatedAt
 
@@ -1419,11 +1492,17 @@ model hr_employee {
   documents       hr_document[]
   payslips        hr_payslip[]
   incidents       hr_incident[]
+  capabilities    hr_employee_capability[]
+  otpResetRequests hr_otp_reset_request[]
+  team            hr_team?  @relation(fields: [teamId], references: [id], onDelete: SetNull)
 
   @@index([HotelName])
   @@index([HotelName, status])
   @@index([HotelName, department])
+  @@index([HotelName, orgPosition])
+  @@index([teamId])
   @@index([HotelName, credentialUserName])
+  @@index([portalOtpLookup])
 }
 
 /// HR — tenant-configured leave types (empty until HR adds them)
@@ -1454,8 +1533,30 @@ model hr_department {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
+  teams hr_team[]
+
   @@unique([HotelName, code])
   @@index([HotelName])
+}
+
+/// HR — optional teams under a department
+model hr_team {
+  id           Int      @id @default(autoincrement())
+  HotelName    String
+  departmentId Int
+  code         String
+  label        String
+  active       Boolean  @default(true)
+  sortOrder    Int      @default(0)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  department hr_department @relation(fields: [departmentId], references: [id], onDelete: Cascade)
+  employees  hr_employee[]
+
+  @@unique([HotelName, departmentId, code])
+  @@index([HotelName])
+  @@index([departmentId])
 }
 
 /// HR — tenant-configured incident categories with optional pay impact
@@ -1506,15 +1607,20 @@ model hr_leave_request {
   reason       String    @db.Text
   /// pending | approved | rejected | cancelled
   status       String    @default("pending")
+  /// Attached approval flow (nullable = resolved at runtime via defaults)
+  flowId       Int?
+  currentStepIndex Int   @default(0)
   decidedBy    String    @default("")
   decidedAt    DateTime?
   createdAt    DateTime  @default(now())
 
   employee hr_employee @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  flow     hr_approval_flow? @relation(fields: [flowId], references: [id], onDelete: SetNull)
 
   @@index([HotelName])
   @@index([HotelName, status])
   @@index([employeeId])
+  @@index([flowId])
 }
 
 model hr_attendance {
@@ -1703,6 +1809,224 @@ model hr_incident {
 
   @@index([HotelName])
   @@index([employeeId])
+}
+
+/// HR — granted capabilities for hotcol-emp (e.g. leave_approve_supervisor)
+model hr_employee_capability {
+  id         Int      @id @default(autoincrement())
+  HotelName  String
+  employeeId Int
+  /// e.g. leave_approve_supervisor
+  code       String
+  /// { departmentCodes?: string[], employeeIds?: number[] }
+  scopeJson  Json?
+  grantedBy  String   @default("")
+  active     Boolean  @default(true)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  employee hr_employee @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+
+  @@unique([HotelName, employeeId, code])
+  @@index([HotelName])
+  @@index([employeeId])
+  @@index([HotelName, code, active])
+}
+
+/// HR — configurable approval chain (per request type + optional department)
+model hr_approval_flow {
+  id                     Int      @id @default(autoincrement())
+  HotelName              String
+  /// leave | overtime | document | incident | schedule_change | timesheet
+  requestType            String
+  /// null = tenant default for this requestType
+  departmentId           Int?
+  requireTeamLeaderFirst Boolean  @default(true)
+  /// [{ "kind": "team_leader"|"department_leader"|"hr"|"manager"|"admin" }, ...]
+  stepsJson              Json
+  active                 Boolean  @default(true)
+  createdAt              DateTime @default(now())
+  updatedAt              DateTime @updatedAt
+
+  leaveRequests hr_leave_request[]
+
+  @@index([HotelName, requestType, active])
+  @@index([HotelName, departmentId])
+}
+
+/// HR — audit of each approval / reject / escalate step
+model hr_approval_action {
+  id               Int      @id @default(autoincrement())
+  HotelName        String
+  requestType      String
+  requestId        Int
+  stepIndex        Int
+  stepKind         String
+  /// employee | credential
+  actorType        String
+  actorEmployeeId  Int?
+  actorUserName    String   @default("")
+  /// approved | rejected | escalated
+  decision         String
+  note             String   @default("") @db.VarChar(500)
+  createdAt        DateTime @default(now())
+
+  @@index([HotelName, requestType, requestId])
+  @@index([HotelName, createdAt])
+}
+
+/// HR — portal OTP reset: HR requests → Manager approves → Manager-only preview
+model hr_otp_reset_request {
+  id          Int       @id @default(autoincrement())
+  HotelName   String
+  employeeId  Int
+  requestedBy String    @default("")
+  /// pending | approved | rejected | cancelled
+  status      String    @default("pending")
+  decidedBy   String    @default("")
+  decidedAt   DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  employee hr_employee @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+
+  @@index([HotelName])
+  @@index([employeeId])
+  @@index([HotelName, status])
+}
+
+/// HR — unified in-app notifications (bell); not a separate announcement product
+model hr_notification {
+  id            Int       @id @default(autoincrement())
+  HotelName     String
+  /// Role audience when not employee-targeted: Manager | HR | Finance | Admin | ""
+  recipientRole String    @default("")
+  employeeId    Int?
+  /// otp_reset_pending | otp_reset_decided | hr_message | leave_pending | leave_countersign | ...
+  kind          String
+  title         String
+  body          String    @db.Text
+  href          String    @default("")
+  /// pending | done | "" — for actionable items
+  actionStatus  String    @default("")
+  createdBy     String    @default("")
+  readAt        DateTime?
+  createdAt     DateTime  @default(now())
+
+  @@index([HotelName])
+  @@index([HotelName, recipientRole])
+  @@index([employeeId])
+  @@index([HotelName, createdAt])
+}
+
+/// HR chat — emp↔emp and emp↔manager threads (HR Module)
+model hr_chat_thread {
+  id                     Int      @id @default(autoincrement())
+  HotelName              String
+  /// direct | group
+  kind                   String
+  title                  String   @default("")
+  createdByEmployeeId    Int?
+  createdByManagerUserId Int?
+  createdAt              DateTime @default(now())
+  updatedAt              DateTime @updatedAt
+
+  members  hr_chat_member[]
+  messages hr_chat_message[]
+
+  @@index([HotelName, updatedAt])
+  @@index([HotelName, kind])
+}
+
+model hr_chat_member {
+  id         Int       @id @default(autoincrement())
+  threadId   Int
+  employeeId Int?
+  /// Manager (hotel) or Admin (café) seat in the thread
+  isManager  Boolean   @default(false)
+  /// Stable key: "e:{id}" or "m" for manager seat
+  memberKey  String
+  joinedAt   DateTime  @default(now())
+  lastReadAt DateTime?
+
+  thread hr_chat_thread @relation(fields: [threadId], references: [id], onDelete: Cascade)
+
+  @@unique([threadId, memberKey])
+  @@index([threadId])
+  @@index([employeeId])
+}
+
+model hr_chat_message {
+  id               Int      @id @default(autoincrement())
+  threadId         Int
+  senderEmployeeId Int?
+  senderIsManager  Boolean  @default(false)
+  body             String   @db.Text
+  /// Optional Cloudinary (or CDN) image attachment URL
+  imageUrl         String   @default("")
+  createdAt        DateTime @default(now())
+
+  thread hr_chat_thread @relation(fields: [threadId], references: [id], onDelete: Cascade)
+
+  @@index([threadId, createdAt])
+}
+
+/// Manager/Admin blocks for emp↔emp or emp↔manager
+model hr_chat_block {
+  id          Int      @id @default(autoincrement())
+  HotelName   String
+  /// emp_emp | emp_manager
+  pathType    String
+  employeeIdA Int
+  /// null when pathType is emp_manager (manager side)
+  employeeIdB Int?
+  note        String   @default("")
+  createdBy   String   @default("")
+  createdAt   DateTime @default(now())
+
+  @@index([HotelName])
+  @@index([HotelName, pathType])
+  @@index([employeeIdA])
+  @@index([employeeIdB])
+}
+
+/// HR — Manager must approve: terminate, attendance correction, payroll generate (F06/F12/F17)
+model hr_manager_pending_action {
+  id          Int       @id @default(autoincrement())
+  HotelName   String
+  /// terminate | attendance_correction | payroll_generate
+  kind        String
+  employeeId  Int?
+  payloadJson Json?
+  requestedBy String    @default("")
+  /// pending | approved | rejected
+  status      String    @default("pending")
+  decidedBy   String    @default("")
+  decidedAt   DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  @@index([HotelName, status])
+  @@index([HotelName, kind])
+  @@index([employeeId])
+}
+
+/// HR — biometric device registry (runtime only when tenant hrBiometricsEnabled)
+model hr_biometric_device {
+  id         Int      @id @default(autoincrement())
+  HotelName  String
+  /// zkteco | hikvision | other
+  vendor     String   @default("other")
+  deviceKey  String   @default("")
+  label      String   @default("")
+  active     Boolean  @default(true)
+  lastSyncAt DateTime?
+  notes      String   @default("")
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@unique([HotelName, deviceKey])
+  @@index([HotelName])
 }
 
 /// Canonical crystal (catalyst) product names for inventory / recipe / purchase selectors.
